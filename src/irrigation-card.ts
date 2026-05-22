@@ -165,6 +165,10 @@ export class IrrigationCard extends LitElement implements LovelaceCard {
               <irrigation-valve-row
                 .hass=${this.hass}
                 .valve=${valve}
+                .multiplier=${entityNumericValue(
+                  this.hass,
+                  this._resolved.multiplier,
+                ) ?? 1}
                 .compact=${this._config.compact || false}
               ></irrigation-valve-row>
             `,
