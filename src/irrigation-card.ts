@@ -9,6 +9,8 @@ import {
   getControllerStatus,
   entityState,
   entityNumericValue,
+  REGISTRY_RETRY_MS,
+  clearDeviceCache,
 } from "./utils/entity-helpers";
 import { localize } from "./localize";
 import { enableDebug, disableDebug, logRender } from "./utils/logger";
@@ -24,8 +26,22 @@ export class IrrigationCard extends LitElement implements LovelaceCard {
   @state() private _config!: IrrigationCardConfig;
   @state() private _resolved: ResolvedConfig = { valves: [] };
   private _asyncDiscoveryDone = false;
+  private _asyncDiscoveryRunning = false;
+  private _discoveryRunId = 0;
+  private _retryTimer?: ReturnType<typeof setTimeout>;
 
   static styles = cardStyles;
+
+  public disconnectedCallback(): void {
+    super.disconnectedCallback();
+    if (this._retryTimer) {
+      clearTimeout(this._retryTimer);
+      this._retryTimer = undefined;
+    }
+    if (this._config?.device_id) {
+      clearDeviceCache(this._config.device_id);
+    }
+  }
 
   public static async getConfigElement() {
     await import("./editor");
@@ -43,8 +59,20 @@ export class IrrigationCard extends LitElement implements LovelaceCard {
     if (!config.device_id && !config.valves?.length && !config.main_switch) {
       throw new Error(localize(undefined, "card.error_no_config"));
     }
+    // Clear cache for the previous device if device_id changed
+    const prevDeviceId = this._config?.device_id;
+    if (prevDeviceId && prevDeviceId !== config.device_id) {
+      clearDeviceCache(prevDeviceId);
+    }
     this._config = config;
     this._asyncDiscoveryDone = false;
+    this._discoveryRunId++;
+    this._asyncDiscoveryRunning = false;
+    this._resolved = { valves: [] };
+    if (this._retryTimer) {
+      clearTimeout(this._retryTimer);
+      this._retryTimer = undefined;
+    }
   }
 
   public getCardSize(): number {
@@ -52,15 +80,24 @@ export class IrrigationCard extends LitElement implements LovelaceCard {
   }
 
   protected shouldUpdate(changedProps: PropertyValues): boolean {
-    if (changedProps.has("_config") || changedProps.has("_resolved"))
+    // For device-based configs, suppress renders until async discovery completes
+    // but allow _config changes through so stale UI is cleared immediately
+    if (this._config?.device_id && !this._asyncDiscoveryDone) {
+      // Trigger async discovery on hass arrival or config change
+      if ((changedProps.has("hass") || changedProps.has("_config")) && !this._asyncDiscoveryRunning) {
+        this._runAsyncDiscovery();
+      }
+      // Allow render on config change to clear stale UI
+      if (changedProps.has("_config")) return true;
+      // Allow first hass arrival so the card renders a placeholder
+      if (changedProps.has("hass") && !changedProps.get("hass")) return true;
+      return false;
+    }
+    if (changedProps.has("_resolved") || changedProps.has("_config"))
       return true;
     if (changedProps.has("hass")) {
       const oldHass = changedProps.get("hass") as HomeAssistant | undefined;
       if (!oldHass) return true;
-      // Trigger async discovery on first hass update if not done
-      if (!this._asyncDiscoveryDone) {
-        this._runAsyncDiscovery();
-      }
       const relevantEntities = this._getRelevantEntities(this._resolved);
       return relevantEntities.some(
         (id) => oldHass.states[id] !== this.hass.states[id],
@@ -71,25 +108,54 @@ export class IrrigationCard extends LitElement implements LovelaceCard {
 
   protected updated(changedProps: PropertyValues): void {
     super.updated(changedProps);
-    if (changedProps.has("_config") && this.hass) {
-      // Try sync discovery first
-      this._resolved = discoverEntities(this.hass, this._config);
-      // If sync didn't find valves, trigger async
-      if (
-        this._resolved.valves.length === 0 &&
-        this._config.device_id &&
-        !this._asyncDiscoveryDone
-      ) {
+    if (!this.hass || !this._config) return;
+
+    const configChanged = changedProps.has("_config");
+    const hassArrived = changedProps.has("hass") && !changedProps.get("hass");
+
+    if (configChanged || hassArrived) {
+      if (this._config.device_id) {
+        // Use async discovery to get original_name cache before rendering
         this._runAsyncDiscovery();
+      } else if (!this._asyncDiscoveryDone) {
+        // No device_id — sync discovery is sufficient
+        this._resolved = discoverEntities(this.hass, this._config);
+        this._asyncDiscoveryDone = true;
       }
     }
   }
 
   private async _runAsyncDiscovery(): Promise<void> {
-    if (this._asyncDiscoveryDone || !this.hass || !this._config) return;
-    this._asyncDiscoveryDone = true;
-    const resolved = await discoverEntitiesAsync(this.hass, this._config);
-    this._resolved = resolved;
+    if (this._asyncDiscoveryRunning || !this.hass || !this._config) return;
+    this._asyncDiscoveryRunning = true;
+    const runId = this._discoveryRunId;
+    const configSnapshot = this._config;
+    try {
+      const resolved = await discoverEntitiesAsync(this.hass, configSnapshot);
+      if (this._discoveryRunId === runId) {
+        this._resolved = resolved;
+        this._asyncDiscoveryDone = true;
+      }
+    } catch (err) {
+      console.warn("irrigation-card: async discovery failed:", err);
+      if (this._discoveryRunId === runId) {
+        this._resolved = discoverEntities(this.hass, configSnapshot);
+        this._asyncDiscoveryDone = true;
+        // Schedule retry after WS failure TTL (60s)
+        if (this._retryTimer) clearTimeout(this._retryTimer);
+        const timer = setTimeout(() => {
+          if (this._retryTimer === timer) this._retryTimer = undefined;
+          if (this._discoveryRunId === runId && this.isConnected) {
+            this._runAsyncDiscovery();
+          }
+        }, REGISTRY_RETRY_MS);
+        this._retryTimer = timer;
+      }
+    } finally {
+      if (this._discoveryRunId === runId) {
+        this._asyncDiscoveryRunning = false;
+      }
+    }
   }
 
   protected render() {

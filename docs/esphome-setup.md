@@ -210,7 +210,7 @@ Repeat for each zone, adjusting names and `initial_value` / `max_value` as neede
 
 These template sensors expose controller state to HA — the Irrigation Card uses them for status display, progress bar, and time remaining.
 
-> **Important:** The status sensor must publish exactly **Running**, **Paused**, **Idle**, or **Standby** (case-insensitive). The card matches these values verbatim — any other text (e.g. zone names) will prevent Pause/Stop controls from appearing.
+> **Important:** The status sensor values **Idle**, **Paused**, and **Standby** must be in English (case-insensitive). Any other value (including zone-specific text like "Zone 1 Active") is treated as **running** — Pause/Stop controls will appear. Using "Running" is recommended for clarity but not required.
 
 ```yaml
 text_sensor:

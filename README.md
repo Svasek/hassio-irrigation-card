@@ -10,6 +10,7 @@ Home Assistant Lovelace card for controlling [ESPHome Sprinkler](https://esphome
 ## Features
 
 - Auto-discovery of sprinkler entities from HA device registry
+- Rename-resilient: uses ESPHome `original_name` for matching — renaming entities in the HA UI won't break discovery
 - Localization: English and Czech (auto-detected from HA settings)
 - Per-valve control: on/off toggle, enable/disable for cycle, run duration adjustment
 - Cycle controls: start, stop, pause, resume
