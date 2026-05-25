@@ -9,11 +9,6 @@ substitutions:
   software_version: 2022 10 18  v11
   sensor_update_frequency: 120s
   # DO NOT CHANGE ANYTHING BELOW THIS LINE ###
-  zone_1_valve_id: valve_0
-  zone_2_valve_id: valve_1
-  zone_3_valve_id: valve_2
-  zone_4_valve_id: valve_3
-  zone_5_valve_id: valve_4
   esphome_name: irrigation-ctrl-unit-$devicename_unit_id
   esphome_comment: Five Valve Irrigation Control - $unit_id
   esphome_project_name: kratochj.Four Valve Irrigation Control - $unit_id
@@ -27,6 +22,7 @@ esp8266:
 
 esphome:
   name: $esphome_name
+  friendly_name: $upper_devicename
   comment: $esphome_comment
   project:
     name: $esphome_project_name
@@ -38,10 +34,6 @@ esphome:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
           state: "Idle"
-      # Set multiplier to 60, convert seconds to minutes
-      - sprinkler.set_multiplier:
-          id: $devicename
-          multiplier: 60
 
 # WiFi connection, replace these with values for your WiFi.
 wifi:
@@ -51,9 +43,15 @@ wifi:
 # Enable logging
 logger:
 
+# Enable Home Assistant API with encryption
+api:
+  encryption:
+    key: !secret api_enc_key
+
 # Enable over-the-air updates.
 ota:
-  password: !secret ota_password
+  - platform: esphome
+    password: !secret ota_password
 
 # Enable Web server.
 web_server:
@@ -77,6 +75,13 @@ text_sensor:
     bssid:
       name: $devicename BSSID
 
+  # Expose Valve Status as a sensor.
+  - platform: template
+    id: valve_status_$devicename_unit_id
+    name: "Status ($unit_id)"
+    update_interval: never
+    icon: "mdi:information-variant"
+
   # Expose Time Remaining as a sensor.
   - platform: template
     id: time_remaining_$devicename_unit_id
@@ -84,19 +89,19 @@ text_sensor:
     update_interval: $sensor_update_frequency
     icon: "mdi:timer-sand"
     lambda: |-
-      int seconds = round(id($devicename).time_remaining_active_valve().value_or(0));
+      int seconds = round(id($devicename).time_remaining_current_operation().value_or(0));
       int days = seconds / (24 * 3600);
       seconds = seconds % (24 * 3600);
       int hours = seconds / 3600;
       seconds = seconds % 3600;
-      int minutes = seconds /  60;
+      int minutes = seconds / 60;
       seconds = seconds % 60;
-        return {
-          ((days ? String(days) + "d " : "") +
-          (hours ? String(hours) + "h " : "") +
-          (minutes ? String(minutes) + "m " : "") +
-          (String(seconds) + "s")
-          ).c_str()};
+      std::string result;
+      if (days) result += std::to_string(days) + "d ";
+      if (hours) result += std::to_string(hours) + "h ";
+      if (minutes) result += std::to_string(minutes) + "m ";
+      result += std::to_string(seconds) + "s";
+      return result;
 
   # Expose Progress Percent as a sensor.
   - platform: template
@@ -105,135 +110,140 @@ text_sensor:
     update_interval: $sensor_update_frequency
     icon: "mdi:progress-clock"
     lambda: |-
-      int progress_percent = round(((id($devicename).valve_run_duration_adjusted(id($devicename).active_valve().value_or(0)) - id($devicename).time_remaining_active_valve().value_or(0)) * 100 / id($devicename).valve_run_duration_adjusted(id($devicename).active_valve().value_or(0))));
-      std::string progress_percent_as_string = std::to_string(progress_percent);
-      return progress_percent_as_string;
-
-  # Expose Valve Status as a sensor.
-  - platform: template
-    id: valve_status_$devicename_unit_id
-    name: "Status ($unit_id)"
-    update_interval: never
-    icon: "mdi:information-variant"
-
-number:
-  - platform: template
-    id: $zone_1_valve_id
-    name: $zone_1_name
-    min_value: 1
-    max_value: 60
-    step: 1
-    unit_of_measurement: $uom
-    icon: "mdi:timer-outline"
-    mode: box
-    lambda: "return id($devicename).valve_run_duration(0);"
-    set_action:
-      - sprinkler.set_valve_run_duration:
-          id: $devicename
-          valve_number: 0
-          run_duration: !lambda 'return x;'
-
-  - platform: template
-    id: $zone_2_valve_id
-    name: $zone_2_name
-    min_value: 1
-    max_value: 60
-    step: 1
-    unit_of_measurement: $uom
-    icon: "mdi:timer-outline"
-    mode: box
-    lambda: "return id($devicename).valve_run_duration(1);"
-    set_action:
-      - sprinkler.set_valve_run_duration:
-          id: $devicename
-          valve_number: 1
-          run_duration: !lambda 'return x;'
-
-  - platform: template
-    id: $zone_3_valve_id
-    name: $zone_3_name
-    min_value: 1
-    max_value: 60
-    step: 1
-    unit_of_measurement: $uom
-    icon: "mdi:timer-outline"
-    mode: box
-    lambda: "return id($devicename).valve_run_duration(2);"
-    set_action:
-      - sprinkler.set_valve_run_duration:
-          id: $devicename
-          valve_number: 2
-          run_duration: !lambda 'return x;'
-
-  - platform: template
-    id: $zone_4_valve_id
-    name: $zone_4_name
-    min_value: 1
-    max_value: 60
-    step: 1
-    unit_of_measurement: $uom
-    icon: "mdi:timer-outline"
-    mode: box
-    lambda: "return id($devicename).valve_run_duration(3);"
-    set_action:
-      - sprinkler.set_valve_run_duration:
-          id: $devicename
-          valve_number: 3
-          run_duration: !lambda 'return x;'
-
-  - platform: template
-    id: $zone_5_valve_id
-    name: $zone_5_name
-    min_value: 1
-    max_value: 60
-    step: 1
-    unit_of_measurement: $uom
-    icon: "mdi:timer-outline"
-    mode: box
-    lambda: "return id($devicename).valve_run_duration(4);"
-    set_action:
-      - sprinkler.set_valve_run_duration:
-          id: $devicename
-          valve_number: 4
-          run_duration: !lambda 'return x;'
+      uint32_t total = id($devicename).total_cycle_time_enabled_valves();
+      auto rep = id($devicename).repeat();
+      if (rep.has_value()) {
+        total *= (rep.value() + 1);
+      }
+      if (total == 0) {
+        return std::string("0");
+      }
+      uint32_t remaining = id($devicename).time_remaining_current_operation().value_or(0);
+      int progress = round(((float)(total - remaining) / (float)total) * 100.0f);
+      if (progress < 0) progress = 0;
+      if (progress > 100) progress = 100;
+      return std::to_string(progress);
 
 sprinkler:
   - id: $devicename
     main_switch:
       name: "Start/Stop/Resume ($unit_id)"
       id: main_switch
-    auto_advance_switch: "Auto Advance ($unit_id)"
-    reverse_switch: "Reverse ($unit_id)"
+    auto_advance_switch:
+      name: "Auto Advance ($unit_id)"
+      icon: "mdi:page-next-outline"
+      restore_mode: RESTORE_DEFAULT_ON
+    reverse_switch:
+      name: "Reverse ($unit_id)"
+      icon: "mdi:undo-variant"
+    multiplier_number:
+      name: "Multiplier ($unit_id)"
+      icon: "mdi:multiplication"
+      initial_value: 1.0
+      min_value: 0.1
+      max_value: 3.0
+      step: 0.1
+      restore_value: true
+    repeat_number:
+      name: "Repeat ($unit_id)"
+      icon: "mdi:repeat"
+      initial_value: 0
+      min_value: 0
+      max_value: 5
+      step: 1
+      restore_value: true
     valve_open_delay: 1s
+    pump_start_pump_delay: 2s
+    pump_stop_valve_delay: 2s
     valves:
-      - valve_switch: $zone_1_name
-        enable_switch: Enable $zone_1_name
+      - valve_switch:
+          name: $zone_1_name
+          icon: "mdi:sprinkler-variant"
+        enable_switch:
+          name: Enable $zone_1_name
+          icon: "mdi:check-circle-outline"
         pump_switch_id: ${devicename}_pump
-        run_duration: 5s
+        run_duration_number:
+          name: "$zone_1_name Run Duration"
+          unit_of_measurement: $uom
+          icon: "mdi:timer-outline"
+          initial_value: 15
+          min_value: 1
+          max_value: 60
+          step: 1
+          restore_value: true
         valve_switch_id: ${devicename}_1
 
-      - valve_switch: $zone_2_name
-        enable_switch: Enable $zone_2_name
+      - valve_switch:
+          name: $zone_2_name
+          icon: "mdi:sprinkler-variant"
+        enable_switch:
+          name: Enable $zone_2_name
+          icon: "mdi:check-circle-outline"
         pump_switch_id: ${devicename}_pump
-        run_duration: 5s
+        run_duration_number:
+          name: "$zone_2_name Run Duration"
+          unit_of_measurement: $uom
+          icon: "mdi:timer-outline"
+          initial_value: 15
+          min_value: 1
+          max_value: 60
+          step: 1
+          restore_value: true
         valve_switch_id: ${devicename}_2
 
-      - valve_switch: $zone_3_name
-        enable_switch: Enable $zone_3_name
+      - valve_switch:
+          name: $zone_3_name
+          icon: "mdi:sprinkler-variant"
+        enable_switch:
+          name: Enable $zone_3_name
+          icon: "mdi:check-circle-outline"
         pump_switch_id: ${devicename}_pump
-        run_duration: 5s
+        run_duration_number:
+          name: "$zone_3_name Run Duration"
+          unit_of_measurement: $uom
+          icon: "mdi:timer-outline"
+          initial_value: 15
+          min_value: 1
+          max_value: 60
+          step: 1
+          restore_value: true
         valve_switch_id: ${devicename}_3
 
-      - valve_switch: $zone_4_name
-        enable_switch: Enable $zone_4_name
+      - valve_switch:
+          name: $zone_4_name
+          icon: "mdi:sprinkler-variant"
+        enable_switch:
+          name: Enable $zone_4_name
+          icon: "mdi:check-circle-outline"
         pump_switch_id: ${devicename}_pump
-        run_duration: 5s
+        run_duration_number:
+          name: "$zone_4_name Run Duration"
+          unit_of_measurement: $uom
+          icon: "mdi:timer-outline"
+          initial_value: 15
+          min_value: 1
+          max_value: 60
+          step: 1
+          restore_value: true
         valve_switch_id: ${devicename}_4
 
-      - valve_switch: $zone_5_name
-        enable_switch: Enable $zone_5_name
+      - valve_switch:
+          name: $zone_5_name
+          icon: "mdi:sprinkler-variant"
+        enable_switch:
+          name: Enable $zone_5_name
+          icon: "mdi:check-circle-outline"
         pump_switch_id: ${devicename}_pump
-        run_duration: 8s
+        run_duration_number:
+          name: "$zone_5_name Run Duration"
+          unit_of_measurement: $uom
+          icon: "mdi:timer-outline"
+          initial_value: 8
+          min_value: 1
+          max_value: 60
+          step: 1
+          restore_value: true
         valve_switch_id: ${devicename}_5
 
 button:
@@ -267,7 +277,7 @@ switch:
     on_turn_on:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
-          state: "$zone_1_name Active"
+          state: "Running"
     on_turn_off:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
@@ -284,7 +294,7 @@ switch:
     on_turn_on:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
-          state: "$zone_2_name Active"
+          state: "Running"
     on_turn_off:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
@@ -301,7 +311,7 @@ switch:
     on_turn_on:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
-          state: "$zone_3_name Active"
+          state: "Running"
     on_turn_off:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
@@ -318,7 +328,7 @@ switch:
     on_turn_on:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
-          state: "$zone_4_name Active"
+          state: "Running"
     on_turn_off:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
@@ -335,7 +345,7 @@ switch:
     on_turn_on:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
-          state: "$zone_5_name Active"
+          state: "Running"
     on_turn_off:
       - text_sensor.template.publish:
           id: valve_status_$devicename_unit_id
