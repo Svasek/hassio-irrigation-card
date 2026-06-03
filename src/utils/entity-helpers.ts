@@ -7,6 +7,25 @@ import { logDiscovery, logServiceCall } from "./logger";
 type HassAny = any;
 
 /**
+ * Module-level cache for original_name values fetched via WS API.
+ * hass.entities[id].original_name is undefined for ESPHome entities,
+ * but the WS entity registry list does return it.
+ */
+const originalNameCache = new Map<string, string>();
+const cachedDeviceEntityIds = new Map<string, Set<string>>();
+let registryPromise: Promise<RegistryEntry[]> | null = null;
+let registryFailedAt = 0;
+
+/** Clear cached entries for a device so they don't accumulate when configs change. */
+export function clearDeviceCache(deviceId: string): void {
+  const ids = cachedDeviceEntityIds.get(deviceId);
+  if (ids) {
+    for (const id of ids) originalNameCache.delete(id);
+    cachedDeviceEntityIds.delete(deviceId);
+  }
+}
+
+/**
  * Discover entities from a HA device.
  * Uses hass.entities (entity registry) to find entities belonging to a device.
  * Falls back to WebSocket call if hass.entities is not available.
@@ -57,39 +76,132 @@ export function discoverEntities(
 /**
  * Async version of entity discovery that uses WebSocket API as fallback.
  * Call this once after config is set, store the result.
+ * Skips the WS fetch when all discovery targets (valves + controller fields)
+ * are explicitly configured, avoiding unnecessary round-trips.
  */
+// Controller fields that autoDiscoverFromDevice can fill in.
+// When all of these (+ valves) are explicitly set, the WS fetch is unnecessary.
+const DISCOVERABLE_FIELDS: (keyof IrrigationCardConfig)[] = [
+  "main_switch", "auto_advance_switch", "reverse_switch", "pause_button",
+  "queue_enable_switch", "standby_switch", "multiplier", "repeat",
+  "status_sensor", "progress_sensor", "time_remaining_sensor",
+];
+
 export async function discoverEntitiesAsync(
   hass: HomeAssistant,
   config: IrrigationCardConfig,
 ): Promise<ResolvedConfig> {
-  const resolved = discoverEntities(hass, config);
-
-  // If sync discovery found valves or no device_id, return
-  if (resolved.valves.length > 0 || !config.device_id) {
-    return resolved;
+  // Skip WS fetch when nothing needs auto-discovery:
+  // no device_id, or all discovery targets are explicitly configured
+  const fullyConfigured = !!config.valves?.length &&
+    DISCOVERABLE_FIELDS.every((f) => config[f]);
+  if (!config.device_id || fullyConfigured) {
+    return discoverEntities(hass, config);
   }
 
-  // Fallback: use WebSocket to fetch entity registry
-  try {
-    const entityRegistry: Array<{ entity_id: string; device_id: string }> =
-      await (hass as HassAny).callWS({
-        type: "config/entity_registry/list",
-      });
+  // Populate original_name cache before discovery so matchesFriendlyName
+  // can use integration-reported names on the first run (avoids flash of
+  // incomplete content). The in-flight promise is shared so concurrent
+  // callers (multiple cards) deduplicate into a single WS request.
+  // Throws on WS failure so the card can schedule a retry.
+  const registry = await fetchEntityRegistry(hass);
 
-    const deviceEntities = entityRegistry
-      .filter((e) => e.device_id === config.device_id)
-      .map((e) => e.entity_id);
-
-    logDiscovery(`Device ${config.device_id}: found ${deviceEntities.length} entities (async/WS)`, deviceEntities);
-    if (deviceEntities.length > 0) {
-      autoDiscoverFromDevice(hass, deviceEntities, resolved, config);
+  // Populate originalNameCache only for this device's entities.
+  // Clear previous entries for this device first to remove stale entity_ids.
+  const prevIds = cachedDeviceEntityIds.get(config.device_id);
+  if (prevIds) {
+    for (const id of prevIds) originalNameCache.delete(id);
+  }
+  const newIds = new Set<string>();
+  for (const entry of registry) {
+    if (entry.device_id === config.device_id) {
+      newIds.add(entry.entity_id);
+      if (entry.original_name) {
+        originalNameCache.set(entry.entity_id, entry.original_name);
+      }
     }
-    logDiscovery("Resolved config (async)", resolved);
-  } catch (err) {
-    console.error("irrigation-card: Failed to fetch entity registry:", err);
   }
+  cachedDeviceEntityIds.set(config.device_id, newIds);
+  logDiscovery(`originalNameCache: ${newIds.size} entities for device ${config.device_id}`);
+
+  // Build resolved config from explicit values only, then run a single
+  // autoDiscoverFromDevice pass with WS-derived entities.  This avoids
+  // the double-discovery that would happen if we called discoverEntities
+  // (which runs its own sync device discovery internally).
+  const resolved: ResolvedConfig = { valves: [] };
+  if (config.valves && config.valves.length > 0) {
+    resolved.valves = config.valves.map((v) => ({
+      name: v.name || friendlyName(hass, v.valve_switch) || v.valve_switch,
+      valve_switch: v.valve_switch,
+      enable_switch: v.enable_switch,
+      run_duration: v.run_duration,
+      icon: v.icon || DEFAULT_VALVE_ICON,
+    }));
+  }
+  resolved.main_switch = config.main_switch;
+  resolved.auto_advance_switch = config.auto_advance_switch;
+  resolved.reverse_switch = config.reverse_switch;
+  resolved.pause_button = config.pause_button;
+  resolved.queue_enable_switch = config.queue_enable_switch;
+  resolved.standby_switch = config.standby_switch;
+  resolved.multiplier = config.multiplier;
+  resolved.repeat = config.repeat;
+  resolved.status_sensor = config.status_sensor;
+  resolved.progress_sensor = config.progress_sensor;
+  resolved.time_remaining_sensor = config.time_remaining_sensor;
+
+  const deviceEntities = Array.from(newIds);
+  logDiscovery(`Device ${config.device_id}: found ${deviceEntities.length} entities (async/WS)`, deviceEntities);
+  if (deviceEntities.length > 0) {
+    autoDiscoverFromDevice(hass, deviceEntities, resolved, config);
+  }
+  logDiscovery("Resolved config (async)", resolved);
 
   return resolved;
+}
+
+interface RegistryEntry {
+  entity_id: string;
+  device_id: string;
+  original_name?: string;
+}
+
+/**
+ * Fetch entity registry via WS API. Returns the full registry so callers
+ * can filter by device_id and populate originalNameCache themselves.
+ * Caches the in-flight promise so concurrent callers share a single WS request.
+ * The promise is cleared after successful resolve so the full array can be GC'd
+ * and subsequent calls fetch fresh data (picking up registry changes).
+ * On failure the rejected promise is cached with REGISTRY_RETRY_MS TTL.
+ */
+export const REGISTRY_RETRY_MS = 60_000;
+
+function fetchEntityRegistry(hass: HomeAssistant): Promise<RegistryEntry[]> {
+  if (registryPromise && registryFailedAt && Date.now() - registryFailedAt >= REGISTRY_RETRY_MS) {
+    registryPromise = null;
+    registryFailedAt = 0;
+  }
+  if (!registryPromise) {
+    registryPromise = (async () => {
+      try {
+        const registry: RegistryEntry[] =
+          await (hass as HassAny).callWS({
+            type: "config/entity_registry/list",
+          });
+        registryFailedAt = 0;
+        // Clear cached promise so the full array can be GC'd after callers
+        // extract per-device data. Next call will fetch fresh registry.
+        registryPromise = null;
+        logDiscovery(`Entity registry fetched: ${registry.length} entries`);
+        return registry;
+      } catch (err) {
+        console.warn("irrigation-card: Failed to fetch entity registry:", err);
+        registryFailedAt = Date.now();
+        throw err;
+      }
+    })();
+  }
+  return registryPromise;
 }
 
 function getDeviceEntities(
@@ -240,11 +352,12 @@ function discoverValves(
 }
 
 /**
- * Find a matching entity from candidates by friendly_name or entity_id similarity.
- * Tries multiple strategies:
- * 1. Friendly name of candidate contains the valve display name
- * 2. Friendly name of candidate contains the valve friendly name (with device prefix)
- * 3. Entity ID keyword matching (extract common keywords from valve switch entity_id)
+ * Find a matching entity from candidates by original_name, friendly_name,
+ * or entity_id similarity. Tries multiple strategies:
+ * 1.  Original or friendly name of candidate contains the valve display name
+ * 1b. When valve was renamed, match via valve's originalName against candidate names
+ * 2.  Entity ID keyword matching (extract common keywords from valve switch entity_id)
+ * 3.  Specific keyword matching (last 2 words like "zone_1")
  */
 function findMatchingEntity(
   hass: HomeAssistant,
@@ -252,14 +365,37 @@ function findMatchingEntity(
   valveDisplayName: string,
   valveSwitchId: string,
 ): string | undefined {
-  // Strategy 1: friendly_name contains stripped valve name
-  const match1 = candidates.find((id) => {
-    const fname = (friendlyName(hass, id) || "").toLowerCase();
-    return fname.includes(valveDisplayName.toLowerCase());
-  });
-  if (match1) {
-    logDiscovery(`Match for "${valveSwitchId}": "${match1}" (strategy: friendly_name)`);
-    return match1;
+  // Strategy 1: original or friendly name of candidate contains the valve display name
+  const target = valveDisplayName.toLowerCase().trim();
+  if (target) {
+    const match1 = candidates.find((id) => {
+      const orig = (originalName(hass, id) || "").toLowerCase();
+      const friendly = (friendlyName(hass, id) || "").toLowerCase();
+      return orig.includes(target) || friendly.includes(target);
+    });
+    if (match1) {
+      logDiscovery(`Match for "${valveSwitchId}": "${match1}" (strategy: name match)`);
+      return match1;
+    }
+  }
+
+  // Strategy 1b: when valve was renamed by the user, the candidate's
+  // original_name won't contain the new display name. Fall back to
+  // matching via the valve's original (integration-reported) name.
+  const valveOriginal = originalName(hass, valveSwitchId);
+  if (valveOriginal) {
+    const valveOrigStripped = stripDevicePrefix(hass, valveSwitchId, valveOriginal).toLowerCase().trim();
+    if (valveOrigStripped && valveOrigStripped !== valveDisplayName.toLowerCase()) {
+      const match1b = candidates.find((id) => {
+        const candOrig = stripDevicePrefix(hass, id, originalName(hass, id) || "").toLowerCase();
+        const candFriendly = stripDevicePrefix(hass, id, friendlyName(hass, id) || "").toLowerCase();
+        return candOrig.includes(valveOrigStripped) || candFriendly.includes(valveOrigStripped);
+      });
+      if (match1b) {
+        logDiscovery(`Match for "${valveSwitchId}": "${match1b}" (strategy: original_name)`);
+        return match1b;
+      }
+    }
   }
 
   // Strategy 2: extract zone/valve identifier from entity_id and match
@@ -319,9 +455,10 @@ function stripDevicePrefix(
   if (!devices) return fname;
 
   const device = devices[entities[entityId].device_id];
-  if (!device?.name) return fname;
-
-  const deviceName = device.name;
+  // Use user-renamed device name if available, since HA composes
+  // friendly_name from the effective name (name_by_user || name)
+  const deviceName = device?.name_by_user || device?.name;
+  if (!deviceName) return fname;
   if (fname.startsWith(deviceName)) {
     return fname.slice(deviceName.length).replace(/^\s+/, "");
   }
@@ -333,9 +470,26 @@ function matchesFriendlyName(
   entityId: string,
   pattern: RegExp,
 ): boolean {
-  const fname = friendlyName(hass, entityId) || "";
-  const stripped = stripDevicePrefix(hass, entityId, fname);
-  return pattern.test(stripped) || pattern.test(entityId);
+  const orig = stripDevicePrefix(hass, entityId, originalName(hass, entityId) || "");
+  const friendly = stripDevicePrefix(hass, entityId, friendlyName(hass, entityId) || "");
+  return pattern.test(orig) || pattern.test(friendly) || pattern.test(entityId);
+}
+
+/**
+ * Get the original (integration-reported) name for an entity.
+ * Returns undefined if the original name is not available, letting
+ * callers fall back to friendlyName() or other sources.
+ */
+function originalName(
+  hass: HomeAssistant,
+  entityId: string,
+): string | undefined {
+  const entities = (hass as HassAny).entities;
+  const entry = entities?.[entityId];
+  // 1. Try hass.entities (undefined for ESPHome, but works for other integrations)
+  if (entry?.original_name) return entry.original_name;
+  // 2. Try WS-based cache (works for ESPHome)
+  return originalNameCache.get(entityId);
 }
 
 export function friendlyName(
@@ -415,7 +569,12 @@ export function getControllerStatus(
   if (resolved.status_sensor) {
     const status = entityState(hass, resolved.status_sensor);
     if (status && status !== "unavailable" && status !== "unknown") {
-      return status.toLowerCase();
+      const normalized = status.toLowerCase();
+      // Only recognize known non-running states; anything else means running
+      if (["idle", "paused", "standby"].includes(normalized)) {
+        return normalized;
+      }
+      return "running";
     }
   }
 
